@@ -81,6 +81,19 @@ class HTTPTestExecutor:
             if "{" in path or "}" in path:
                 raise ValueError(f"Unresolved path parameters in {path}")
 
+            parsed_path = urlsplit(path)
+
+            if (
+                not path.startswith("/")
+                or path.startswith("//")
+                or parsed_path.scheme
+                or parsed_path.netloc
+                or parsed_path.query
+                or parsed_path.fragment
+                or "\\" in path
+            ):
+                raise ValueError(f"Unsafe API path: {path}")
+
             response = self.client.request(
                 method=test_case.method,
                 url=path,
