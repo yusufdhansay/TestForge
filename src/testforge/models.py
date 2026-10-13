@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -25,3 +26,28 @@ class APISpecification(BaseModel):
     version: str
     openapi_version: str
     operations: list[APIOperation] = Field(default_factory=list)
+
+
+class TestCategory(str, Enum):
+    __test__ = False
+
+    POSITIVE = "positive"
+    NEGATIVE = "negative"
+
+
+class GeneratedTestCase(BaseModel):
+    test_id: str
+    name: str
+    category: TestCategory
+    method: str
+    path: str
+
+    path_parameters: dict[str, Any] = Field(default_factory=dict)
+
+    query_parameters: dict[str, Any] = Field(default_factory=dict)
+
+    headers: dict[str, str] = Field(default_factory=dict)
+
+    request_body: Any | None = None
+
+    expected_status_codes: list[int] = Field(default_factory=list)
