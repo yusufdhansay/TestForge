@@ -35,6 +35,13 @@ class TestCategory(str, Enum):
     NEGATIVE = "negative"
 
 
+class ResponseExpectation(BaseModel):
+    """Describes why a response status is expected."""
+
+    source: str
+    description: str = ""
+
+
 class GeneratedTestCase(BaseModel):
     test_id: str
     name: str
@@ -51,3 +58,5 @@ class GeneratedTestCase(BaseModel):
     request_body: Any | None = None
 
     expected_status_codes: list[int] = Field(default_factory=list)
+
+    response_expectation: ResponseExpectation | None = None
