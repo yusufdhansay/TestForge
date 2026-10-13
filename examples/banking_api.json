@@ -1,0 +1,72 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Banking API",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/accounts": {
+      "get": {
+        "summary": "List accounts",
+        "operationId": "listAccounts",
+        "responses": {
+          "200": {
+            "description": "Accounts retrieved"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create an account",
+        "operationId": "createAccount",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "balance": {
+                    "type": "number"
+                  }
+                },
+                "required": ["name", "balance"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Account created"
+          }
+        }
+      }
+    },
+    "/accounts/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "integer"
+          }
+        }
+      ],
+      "get": {
+        "summary": "Get account details",
+        "operationId": "getAccount",
+        "responses": {
+          "200": {
+            "description": "Account found"
+          },
+          "404": {
+            "description": "Account not found"
+          }
+        }
+      }
+    }
+  }
+}
