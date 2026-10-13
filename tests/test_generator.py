@@ -85,7 +85,7 @@ def test_generate_seven_banking_cases():
     assert len(cases) == 7
 
 
-def test_negative_cases_have_no_assumed_status():
+def test_negative_cases_follow_documented_expectations():
     specification = OpenAPIParser("examples/banking_api.json").parse()
 
     cases = ContractTestGenerator(specification).generate()
@@ -93,7 +93,13 @@ def test_negative_cases_have_no_assumed_status():
     negative_cases = [case for case in cases if case.category == TestCategory.NEGATIVE]
 
     assert len(negative_cases) == 4
-    assert all(case.expected_status_codes == [] for case in negative_cases)
+
+    for case in negative_cases:
+        if case.expected_status_codes:
+            assert case.response_expectation is not None
+            assert case.response_expectation.source == "openapi"
+        else:
+            assert case.response_expectation is None
 
 
 def test_negative_cases_have_unique_ids():

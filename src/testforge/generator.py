@@ -4,6 +4,7 @@ from testforge.models import (
     TestCategory,
 )
 from testforge.negative_generator import generate_negative_bodies
+from testforge.response_expectations import extract_negative_expectation
 from testforge.schema_generator import generate_value
 
 
@@ -69,6 +70,10 @@ class ContractTestGenerator:
             )
             test_number += 1
 
+            negative_status_codes, negative_expectation = extract_negative_expectation(
+                operation.responses
+            )
+
             if body_schema and body_schema.get("type") == "object":
                 negative_bodies = generate_negative_bodies(body_schema)
 
@@ -86,7 +91,8 @@ class ContractTestGenerator:
                             query_parameters=query_parameters.copy(),
                             headers=headers.copy(),
                             request_body=invalid_body,
-                            expected_status_codes=[],
+                            expected_status_codes=negative_status_codes.copy(),
+                            response_expectation=negative_expectation,
                         )
                     )
                     test_number += 1
