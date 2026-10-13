@@ -1,4 +1,5 @@
 import httpx
+import pytest
 
 from testforge.execution_models import ExecutionStatus
 from testforge.executor import HTTPTestExecutor
@@ -252,3 +253,44 @@ def test_invalid_timeout_configuration():
             transport=httpx.MockTransport(lambda request: httpx.Response(200)),
             timeout=0,
         )
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        "https://other.example/data",
+        "http://other.example/data",
+        "//other.example/data",
+        "/data?redirect=https://other.example",
+        "/data#fragment",
+        "/data\\other",
+        "relative/path",
+    ],
+)
+def test_executor_rejects_unsafe_paths(unsafe_path):
+    requests_sent = []
+
+    def mock_handler(request):
+        requests_sent.append(request)
+        return httpx.Response(200)
+
+    transport = httpx.MockTransport(mock_handler)
+
+    with HTTPTestExecutor(
+        base_url="https://approved.example",
+        transport=transport,
+    ) as executor:
+        test_case = GeneratedTestCase(
+            test_id="unsafe-path-test",
+            name="Reject unsafe API path",
+            category="positive",
+            method="GET",
+            path=unsafe_path,
+            expected_status_codes=[200],
+        )
+
+        result = executor.execute(test_case)
+
+    assert result.status == ExecutionStatus.ERROR
+    assert requests_sent == []
+    assert "Unsafe API path" in result.error_message
