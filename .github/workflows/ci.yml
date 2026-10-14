@@ -1,24 +1,30 @@
+
 name: TestForge CI
 
 on:
   push:
-    branches: [main, "feat/**"]
+    branches:
+      - main
+      - "feat/**"
   pull_request:
-    branches: [main]
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  test:
-    name: Python 3.13 / Quality & Tests
+  quality:
+    name: Code Quality / Python 3.13
     runs-on: ubuntu-latest
-
     timeout-minutes: 10
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -37,16 +43,88 @@ jobs:
       - name: Run lint checks
         run: python -m ruff check .
 
-      - name: Run tests
+      - name: Check patch whitespace
+        run: git diff --check HEAD^ HEAD
+
+  tests:
+    name: Full Regression Suite / Python 3.13
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run complete test suite
         run: |
           mkdir -p test-results
-          python -m pytest -q --junitxml=test-results/pytest-results.xml
+          python -m pytest -q \
+            --junitxml=test-results/pytest-results.xml
 
-      - name: Upload test results
+      - name: Upload regression results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: testforge-pytest-results
+          name: testforge-regression-results
           path: test-results/pytest-results.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+  security:
+    name: Authentication Security Regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run security regression tests
+        run: |
+          mkdir -p test-results
+          python -m pytest -q \
+            tests/test_security.py \
+            tests/test_security_routing.py \
+            tests/test_security_http.py \
+            tests/test_security_cli.py \
+            tests/test_security_compatibility.py \
+            tests/test_auth_generator.py \
+            tests/test_auth_execution.py \
+            tests/test_auth_reporting.py \
+            tests/test_auth_ci.py \
+            --junitxml=test-results/security-results.xml
+
+      - name: Upload security regression results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testforge-security-results
+          path: test-results/security-results.xml
           if-no-files-found: warn
           retention-days: 14

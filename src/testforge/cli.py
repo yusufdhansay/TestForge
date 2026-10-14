@@ -1,3 +1,5 @@
+"""TestForge command-line interface."""
+
 import argparse
 import math
 import os
@@ -6,6 +8,13 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from testforge.auth_execution import build_auth_test_cases
+from testforge.auth_generator import generate_auth_scenarios
+from testforge.auth_reporter import (
+    evaluate_auth_gate,
+    export_auth_report,
+    summarize_auth_results,
+)
 from testforge.coverage import ContractCoverageAnalyzer
 from testforge.executor import (
     HTTPTestExecutor,
@@ -42,7 +51,7 @@ def get_version() -> str:
 
 
 def positive_milliseconds(value: str) -> float:
-    """Parse a finite, strictly positive response-time threshold."""
+    """Parse a finite, positive response-time threshold."""
     try:
         threshold = float(value)
     except ValueError as error:
@@ -59,7 +68,7 @@ def positive_milliseconds(value: str) -> float:
 
 
 def coverage_percentage(value: str) -> float:
-    """Parse a finite coverage percentage between 0 and 100."""
+    """Parse a percentage between 0 and 100."""
     try:
         percentage = float(value)
     except ValueError as error:
@@ -76,7 +85,7 @@ def coverage_percentage(value: str) -> float:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Create the TestForge command-line argument parser."""
+    """Create the TestForge CLI argument parser."""
     parser = argparse.ArgumentParser(
         prog="testforge",
         description="Automated API contract testing and reliability platform.",
@@ -190,7 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_milliseconds,
         default=None,
         metavar="MS",
-        help="Maximum allowed response time in milliseconds (positive number).",
+        help="Maximum allowed response time in milliseconds.",
     )
 
     run_parser.add_argument(
@@ -198,7 +207,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=coverage_percentage,
         default=None,
         metavar="PERCENT",
-        help="Minimum required generated operation coverage (0-100).",
+        help="Minimum generated operation coverage (0-100).",
     )
 
     run_parser.add_argument(
@@ -206,7 +215,31 @@ def build_parser() -> argparse.ArgumentParser:
         type=coverage_percentage,
         default=None,
         metavar="PERCENT",
-        help="Minimum required executed operation coverage (0-100).",
+        help="Minimum executed operation coverage (0-100).",
+    )
+
+    run_parser.add_argument(
+        "--test-auth",
+        action="store_true",
+        help=(
+            "Test whether protected endpoints reject missing, "
+            "invalid, and malformed authentication."
+        ),
+    )
+
+    run_parser.add_argument(
+        "--auth-report",
+        default=None,
+        metavar="FILE",
+        help="Export a separate authentication security report as JSON.",
+    )
+
+    run_parser.add_argument(
+        "--min-auth-pass-rate",
+        type=coverage_percentage,
+        default=None,
+        metavar="PERCENT",
+        help="Minimum authentication test pass rate (0-100). Requires --test-auth.",
     )
 
     return parser
@@ -216,7 +249,7 @@ def validate_report_destination(
     output_path: Path,
     report_format: str,
 ) -> None:
-    """Validate report destination before executing API requests."""
+    """Validate a report destination before sending HTTP requests."""
     expected_suffix = f".{report_format}"
 
     if output_path.suffix.lower() != expected_suffix:
@@ -232,12 +265,7 @@ def validate_report_destination(
 
 
 def has_explicit_security(document: dict) -> bool:
-    """Detect explicit OpenAPI security declarations.
-
-    Security scheme definitions alone do not activate authentication
-    routing. Both security: [] and nonempty security requirements
-    count as explicit declarations.
-    """
+    """Detect root or operation-level security declarations."""
     if "security" in document:
         return True
 
@@ -262,11 +290,25 @@ def has_explicit_security(document: dict) -> bool:
 
 
 def run_tests(args: argparse.Namespace) -> int:
-    """Generate, execute, and report API contract tests."""
+    """Generate, execute, and report contract and authentication tests."""
     if not args.allow_network:
         print(
             "Error: Network access is disabled. "
             "Pass --allow-network to execute real HTTP requests.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.min_auth_pass_rate is not None and not args.test_auth:
+        print(
+            "Error: --min-auth-pass-rate requires --test-auth.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.auth_report is not None and not args.test_auth:
+        print(
+            "Error: --auth-report requires --test-auth.",
             file=sys.stderr,
         )
         return 2
@@ -341,6 +383,17 @@ def run_tests(args: argparse.Namespace) -> int:
         output_path = Path(args.output or f"testforge-report.{args.report}")
         validate_report_destination(output_path, args.report)
 
+        auth_output_path = None
+
+        if args.auth_report is not None:
+            auth_output_path = Path(args.auth_report)
+            validate_report_destination(auth_output_path, "json")
+
+            if auth_output_path.resolve() == output_path.resolve():
+                raise ValueError(
+                    "Authentication report must have a separate output path"
+                )
+
         parser = OpenAPIParser(args.spec)
         document = parser.load()
 
@@ -369,8 +422,6 @@ def run_tests(args: argparse.Namespace) -> int:
             for test_case in test_cases:
                 test_case.max_response_time_ms = args.max_response_time
 
-        # Only pass optional credentials when configured.
-        # Existing mocked constructors remain compatible.
         executor_options = {
             "base_url": args.base_url,
             "allow_network": True,
@@ -378,9 +429,6 @@ def run_tests(args: argparse.Namespace) -> int:
             "allow_state_changes": args.allow_state_changes,
         }
 
-        # Preserve legacy authentication when no security requirements
-        # are explicitly declared. Defining securitySchemes alone
-        # does not change the existing credential behavior.
         if has_explicit_security(document):
             executor_options["operation_auth"] = operation_auth
 
@@ -396,14 +444,47 @@ def run_tests(args: argparse.Namespace) -> int:
             executor_options["basic_username"] = basic_username
             executor_options["basic_password"] = basic_password
 
+        auth_cases = []
+
+        if args.test_auth:
+            scenarios = generate_auth_scenarios(
+                security_analysis,
+                operation_auth,
+            )
+
+            auth_cases = build_auth_test_cases(
+                scenarios,
+                test_cases,
+                security_analysis,
+            )
+
+            if args.max_response_time is not None:
+                for case in auth_cases:
+                    case.max_response_time_ms = args.max_response_time
+
         with HTTPTestExecutor(**executor_options) as executor:
-            results = [executor.execute(test_case) for test_case in test_cases]
+            contract_results = [executor.execute(case) for case in test_cases]
+
+        auth_results = []
+
+        if auth_cases:
+            # Never pass configured credentials to this executor.
+            with HTTPTestExecutor(
+                base_url=args.base_url,
+                allow_network=True,
+                approved_origins={approved_origin},
+                allow_state_changes=args.allow_state_changes,
+            ) as auth_executor:
+                auth_results = [auth_executor.execute(case) for case in auth_cases]
+
+        all_cases = test_cases + auth_cases
+        results = contract_results + auth_results
 
         summary = ExecutionReporter().summarize(results)
 
         coverage = ContractCoverageAnalyzer().analyze(
             specification,
-            test_cases,
+            all_cases,
             results,
         )
 
@@ -413,6 +494,31 @@ def run_tests(args: argparse.Namespace) -> int:
         print(f"Unasserted: {summary.unasserted}")
         print(f"Errors:     {summary.errors}")
         print(f"Pass rate:  {summary.pass_rate:.2f}%")
+
+        auth_summary = None
+        auth_gate_failures = []
+
+        if args.test_auth:
+            auth_summary = summarize_auth_results(
+                auth_cases,
+                auth_results,
+            )
+
+            auth_gate_failures = evaluate_auth_gate(
+                auth_summary,
+                args.min_auth_pass_rate,
+            )
+
+            print()
+            print("Authentication Security")
+            print("-----------------------------")
+            print(f"Generated:  {auth_summary.generated}")
+            print(f"Executed:   {auth_summary.executed}")
+            print(f"Passed:     {auth_summary.passed}")
+            print(f"Failed:     {auth_summary.failed}")
+            print(f"Errors:     {auth_summary.errors}")
+            print(f"Unasserted: {auth_summary.unasserted}")
+            print(f"Pass rate:  {auth_summary.pass_rate:.2f}%")
 
         print()
         print("Contract Coverage")
@@ -453,6 +559,8 @@ def run_tests(args: argparse.Namespace) -> int:
                 f"{args.min_executed_coverage:.2f}%."
             )
 
+        gate_failures.extend(auth_gate_failures)
+
         if args.report == "json":
             JSONReportExporter().export(
                 results,
@@ -466,8 +574,19 @@ def run_tests(args: argparse.Namespace) -> int:
                 coverage=coverage,
             )
 
+        if auth_output_path is not None and auth_summary is not None:
+            export_auth_report(
+                auth_output_path,
+                auth_cases,
+                auth_results,
+                auth_summary,
+            )
+
         print()
         print(f"Report:     {output_path}")
+
+        if auth_output_path is not None:
+            print(f"Auth report: {auth_output_path}")
 
         if gate_failures:
             print()
@@ -477,14 +596,12 @@ def run_tests(args: argparse.Namespace) -> int:
             )
 
             for failure in gate_failures:
-                print(
-                    f"  - {failure}",
-                    file=sys.stderr,
-                )
+                print(f"  - {failure}", file=sys.stderr)
 
         elif (
             args.min_generated_coverage is not None
             or args.min_executed_coverage is not None
+            or args.min_auth_pass_rate is not None
         ):
             print("CI Quality Gates: PASSED")
 
