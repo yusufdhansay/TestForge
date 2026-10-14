@@ -8,6 +8,40 @@ from testforge.response_expectations import extract_negative_expectation
 from testforge.schema_generator import generate_value
 
 
+def extract_response_schemas(
+    responses: dict,
+) -> dict[int, dict]:
+    """Extract JSON response schemas for explicit HTTP status codes."""
+
+    schemas = {}
+
+    for status_code, response_definition in responses.items():
+        if not str(status_code).isdigit():
+            continue
+
+        if not isinstance(response_definition, dict):
+            continue
+
+        content = response_definition.get("content", {})
+
+        if not isinstance(content, dict):
+            continue
+
+        json_content = content.get("application/json")
+
+        if not isinstance(json_content, dict):
+            continue
+
+        schema = json_content.get("schema")
+
+        if not isinstance(schema, dict) or not schema:
+            continue
+
+        schemas[int(status_code)] = schema
+
+    return schemas
+
+
 class ContractTestGenerator:
     def __init__(self, specification: APISpecification):
         self.specification = specification
@@ -17,6 +51,7 @@ class ContractTestGenerator:
         test_number = 1
 
         for operation in self.specification.operations:
+            response_schemas = extract_response_schemas(operation.responses)
             success_status_codes = [
                 int(code)
                 for code in operation.responses
@@ -66,6 +101,7 @@ class ContractTestGenerator:
                     headers=headers.copy(),
                     request_body=request_body,
                     expected_status_codes=success_status_codes,
+                    response_schemas=response_schemas.copy(),
                 )
             )
             test_number += 1
@@ -93,6 +129,7 @@ class ContractTestGenerator:
                             request_body=invalid_body,
                             expected_status_codes=negative_status_codes.copy(),
                             response_expectation=negative_expectation,
+                            response_schemas=response_schemas.copy(),
                         )
                     )
                     test_number += 1
