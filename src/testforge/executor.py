@@ -1,3 +1,4 @@
+import base64
 import re
 from time import perf_counter
 from urllib.parse import quote, urlsplit
@@ -73,10 +74,55 @@ def validate_api_key_configuration(
             raise ValueError(
                 "Bearer authentication and an Authorization API key conflict"
             )
+
     elif not QUERY_NAME_PATTERN.fullmatch(api_key_name):
         raise ValueError("Invalid API key query parameter name")
 
     return validated_key, api_key_name, api_key_location
+
+
+def validate_basic_auth(
+    username: str | None,
+    password: str | None,
+) -> tuple[str | None, str | None]:
+    """Validate HTTP Basic credentials without exposing their values."""
+    if username is None and password is None:
+        return None, None
+
+    if username is None or password is None:
+        raise ValueError("Basic authentication requires both username and password")
+
+    if not isinstance(username, str) or not isinstance(password, str):
+        raise TypeError("Basic authentication credentials must be strings")
+
+    if not username:
+        raise ValueError("Basic authentication username must not be empty")
+
+    if ":" in username:
+        raise ValueError("Basic authentication username must not contain ':'")
+
+    if any(ord(char) < 32 or ord(char) == 127 for char in username + password):
+        raise ValueError(
+            "Basic authentication credentials must not contain control characters"
+        )
+
+    try:
+        username.encode("utf-8")
+        password.encode("utf-8")
+    except UnicodeError as error:
+        raise ValueError(
+            "Basic authentication credentials must be valid UTF-8"
+        ) from error
+
+    return username, password
+
+
+def encode_basic_auth(username: str, password: str) -> str:
+    """Encode validated credentials as an HTTP Basic Authorization value."""
+    username, password = validate_basic_auth(username, password)
+    credentials = f"{username}:{password}".encode()
+    encoded = base64.b64encode(credentials).decode("ascii")
+    return f"Basic {encoded}"
 
 
 class HTTPTestExecutor:
@@ -93,6 +139,8 @@ class HTTPTestExecutor:
         api_key: str | None = None,
         api_key_name: str | None = None,
         api_key_location: str = "header",
+        basic_username: str | None = None,
+        basic_password: str | None = None,
     ):
         if timeout <= 0:
             raise ValueError("Timeout must be positive")
@@ -123,9 +171,18 @@ class HTTPTestExecutor:
 
         self.base_url = base_url.rstrip("/")
         self.allow_state_changes = allow_state_changes
+
         self.bearer_token = (
             validate_bearer_token(bearer_token) if bearer_token is not None else None
         )
+
+        self.basic_username, self.basic_password = validate_basic_auth(
+            basic_username,
+            basic_password,
+        )
+
+        if self.bearer_token is not None and self.basic_username is not None:
+            raise ValueError("Basic and Bearer authentication cannot be used together")
 
         (
             self.api_key,
@@ -136,6 +193,22 @@ class HTTPTestExecutor:
             api_key_name,
             api_key_location,
             self.bearer_token,
+        )
+
+        if (
+            self.basic_username is not None
+            and self.api_key is not None
+            and self.api_key_location == "header"
+            and self.api_key_name.lower() == "authorization"
+        ):
+            raise ValueError(
+                "Basic authentication and an Authorization API key conflict"
+            )
+
+        self.basic_auth_header = (
+            encode_basic_auth(self.basic_username, self.basic_password)
+            if self.basic_username is not None
+            else None
         )
 
         self.client = httpx.Client(
@@ -151,11 +224,18 @@ class HTTPTestExecutor:
         credentials = (
             getattr(self, "bearer_token", None),
             getattr(self, "api_key", None),
+            getattr(self, "basic_auth_header", None),
+            getattr(self, "basic_username", None),
+            getattr(self, "basic_password", None),
         )
 
-        for credential in credentials:
-            if credential:
-                message = message.replace(credential, "[REDACTED]")
+        # Redact longer credentials first to avoid partial replacements.
+        for credential in sorted(
+            (value for value in credentials if value),
+            key=len,
+            reverse=True,
+        ):
+            message = message.replace(credential, "[REDACTED]")
 
         return message
 
@@ -199,23 +279,27 @@ class HTTPTestExecutor:
             ):
                 raise ValueError(f"Unsafe API path: {path}")
 
-            # Copy generated values so authentication cannot mutate tests.
             headers = dict(test_case.headers)
             query_parameters = dict(test_case.query_parameters)
 
             # getattr preserves compatibility with older mocked constructors.
             bearer_token = getattr(self, "bearer_token", None)
+            basic_auth_header = getattr(self, "basic_auth_header", None)
             api_key = getattr(self, "api_key", None)
             api_key_name = getattr(self, "api_key_name", None)
             api_key_location = getattr(self, "api_key_location", "header")
 
-            if bearer_token is not None:
+            if bearer_token is not None or basic_auth_header is not None:
                 headers = {
                     key: value
                     for key, value in headers.items()
                     if key.lower() != "authorization"
                 }
-                headers["Authorization"] = f"Bearer {bearer_token}"
+
+                if bearer_token is not None:
+                    headers["Authorization"] = f"Bearer {bearer_token}"
+                else:
+                    headers["Authorization"] = basic_auth_header
 
             if api_key is not None:
                 if api_key_location == "header":
@@ -226,7 +310,6 @@ class HTTPTestExecutor:
                     }
                     headers[api_key_name] = api_key
                 else:
-                    # The configured credential overrides generated values.
                     query_parameters[api_key_name] = api_key
 
             response = self.client.request(
@@ -239,7 +322,6 @@ class HTTPTestExecutor:
 
             elapsed_ms = (perf_counter() - started) * 1000
 
-            # 1. HTTP status-code assertion.
             if not test_case.expected_status_codes:
                 status = ExecutionStatus.UNASSERTED
             elif response.status_code in test_case.expected_status_codes:
@@ -249,7 +331,6 @@ class HTTPTestExecutor:
 
             error_message = None
 
-            # 2. Response schema and Content-Type validation.
             if status == ExecutionStatus.PASSED:
                 schema = test_case.response_schemas.get(response.status_code)
 
@@ -294,7 +375,6 @@ class HTTPTestExecutor:
                         status = ExecutionStatus.ERROR
                         error_message = f"Invalid response schema: {error.message}"
 
-            # 3. Response-time assertion.
             if (
                 status == ExecutionStatus.PASSED
                 and test_case.max_response_time_ms is not None
