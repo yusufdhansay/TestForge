@@ -50,6 +50,7 @@ class HTTPTestExecutor:
 
         self.base_url = base_url.rstrip("/")
         self.allow_state_changes = allow_state_changes
+
         self.client = httpx.Client(
             base_url=self.base_url,
             transport=transport,
@@ -107,6 +108,7 @@ class HTTPTestExecutor:
 
             elapsed_ms = (perf_counter() - started) * 1000
 
+            # 1. HTTP status-code assertion
             if not test_case.expected_status_codes:
                 status = ExecutionStatus.UNASSERTED
             elif response.status_code in test_case.expected_status_codes:
@@ -116,6 +118,7 @@ class HTTPTestExecutor:
 
             error_message = None
 
+            # 2. Response schema and Content-Type validation
             if status == ExecutionStatus.PASSED:
                 schema = test_case.response_schemas.get(response.status_code)
 
@@ -128,24 +131,25 @@ class HTTPTestExecutor:
                             status = ExecutionStatus.FAILED
                             error_message = (
                                 "Response Content-Type mismatch: "
-                                f"expected application/json, received {content_type or 'missing'}"
+                                "expected application/json, "
+                                f"received {content_type or 'missing'}"
                             )
                         else:
                             schema = normalize_openapi_schema(schema)
+
                             Draft202012Validator.check_schema(schema)
+
+                            if (
+                                response.status_code in {204, 205}
+                                and not response.content
+                            ):
+                                raise ValueError(
+                                    "Response body missing for declared JSON schema"
+                                )
 
                             response_data = response.json()
+
                             Draft202012Validator(schema).validate(response_data)
-                            Draft202012Validator.check_schema(schema)
-
-                        if response.status_code in {204, 205} and not response.content:
-                            # Empty responses are valid only when no body is expected.
-                            raise ValueError(
-                                "Response body missing for declared JSON schema"
-                            )
-
-                        response_data = response.json()
-                        Draft202012Validator(schema).validate(response_data)
 
                     except ValidationError as error:
                         status = ExecutionStatus.FAILED
@@ -161,6 +165,21 @@ class HTTPTestExecutor:
                         status = ExecutionStatus.ERROR
                         error_message = f"Invalid response schema: {error.message}"
 
+            # 3. Response-time assertion
+            # Preserve any existing status or schema failure.
+            if (
+                status == ExecutionStatus.PASSED
+                and test_case.max_response_time_ms is not None
+                and elapsed_ms > test_case.max_response_time_ms
+            ):
+                status = ExecutionStatus.FAILED
+                error_message = (
+                    "Response time exceeded threshold: "
+                    f"{elapsed_ms:.2f} ms > "
+                    f"{test_case.max_response_time_ms:.2f} ms"
+                )
+
+            # 4. Return the final execution result
             return ExecutionResult(
                 test_id=test_case.test_id,
                 status=status,
