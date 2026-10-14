@@ -10,6 +10,7 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from testforge.execution_models import ExecutionResult, ExecutionStatus
 from testforge.models import GeneratedTestCase
 from testforge.schema_normalizer import normalize_openapi_schema
+from testforge.security_routing import OperationAuth
 
 HTTP_TOKEN_PATTERN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 QUERY_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
@@ -141,6 +142,7 @@ class HTTPTestExecutor:
         api_key_location: str = "header",
         basic_username: str | None = None,
         basic_password: str | None = None,
+        operation_auth: dict[tuple[str, str], OperationAuth] | None = None,
     ):
         if timeout <= 0:
             raise ValueError("Timeout must be positive")
@@ -171,6 +173,7 @@ class HTTPTestExecutor:
 
         self.base_url = base_url.rstrip("/")
         self.allow_state_changes = allow_state_changes
+        self.operation_auth = operation_auth
 
         self.bearer_token = (
             validate_bearer_token(bearer_token) if bearer_token is not None else None
@@ -289,24 +292,66 @@ class HTTPTestExecutor:
             api_key_name = getattr(self, "api_key_name", None)
             api_key_location = getattr(self, "api_key_location", "header")
 
-            if bearer_token is not None or basic_auth_header is not None:
+            operation_auth = getattr(self, "operation_auth", None)
+
+            if operation_auth is None:
+                # Legacy behavior for callers without OpenAPI security routing.
+                use_bearer = bearer_token is not None
+                use_basic = basic_auth_header is not None
+                use_api_key = api_key is not None
+            else:
+                key = (test_case.method.upper(), test_case.path)
+
+                if key not in operation_auth:
+                    raise ValueError(
+                        "No security configuration for "
+                        f"{test_case.method} {test_case.path}"
+                    )
+
+                selected = operation_auth[key]
+                use_bearer = selected.bearer
+                use_basic = selected.basic
+                use_api_key = selected.api_key
+
+                # Do not allow generated parameters to inject an
+                # Authorization header into a public operation.
+                if not use_bearer and not use_basic:
+                    headers = {
+                        name: value
+                        for name, value in headers.items()
+                        if name.lower() != "authorization"
+                    }
+
+                # Remove a configured API-key parameter when this
+                # operation does not select API-key authentication.
+                if api_key_name is not None and not use_api_key:
+                    if api_key_location == "header":
+                        headers = {
+                            name: value
+                            for name, value in headers.items()
+                            if name.lower() != api_key_name.lower()
+                        }
+                    else:
+                        query_parameters.pop(api_key_name, None)
+
+            if use_bearer or use_basic:
                 headers = {
-                    key: value
-                    for key, value in headers.items()
-                    if key.lower() != "authorization"
+                    name: value
+                    for name, value in headers.items()
+                    if name.lower() != "authorization"
                 }
 
-                if bearer_token is not None:
+                if use_bearer:
                     headers["Authorization"] = f"Bearer {bearer_token}"
                 else:
                     headers["Authorization"] = basic_auth_header
 
-            if api_key is not None:
+            if use_api_key:
                 if api_key_location == "header":
                     headers = {
-                        key: value
-                        for key, value in headers.items()
-                        if key.lower() != api_key_name.lower()
+                        name: value
+                        for name, value in headers.items()
+                        if name.lower() != api_key_name.lower()
                     }
                     headers[api_key_name] = api_key
                 else:

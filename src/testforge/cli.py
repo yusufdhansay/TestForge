@@ -18,6 +18,19 @@ from testforge.html_reporter import HTMLReportExporter
 from testforge.json_reporter import JSONReportExporter
 from testforge.parser import OpenAPIParser
 from testforge.reporter import ExecutionReporter
+from testforge.security import analyze_security
+from testforge.security_routing import build_operation_auth
+
+HTTP_METHODS = {
+    "get",
+    "post",
+    "put",
+    "patch",
+    "delete",
+    "head",
+    "options",
+    "trace",
+}
 
 
 def get_version() -> str:
@@ -159,7 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--basic-username",
         default=None,
         metavar="USERNAME",
-        help=("HTTP Basic authentication username. Prefer TESTFORGE_BASIC_USERNAME."),
+        help="HTTP Basic authentication username. Prefer TESTFORGE_BASIC_USERNAME.",
     )
 
     run_parser.add_argument(
@@ -216,6 +229,36 @@ def validate_report_destination(
 
     if output_path.exists():
         raise FileExistsError(f"Report already exists: {output_path}")
+
+
+def has_explicit_security(document: dict) -> bool:
+    """Detect explicit OpenAPI security declarations.
+
+    Security scheme definitions alone do not activate authentication
+    routing. Both security: [] and nonempty security requirements
+    count as explicit declarations.
+    """
+    if "security" in document:
+        return True
+
+    paths = document.get("paths", {})
+
+    if not isinstance(paths, dict):
+        return False
+
+    for path_item in paths.values():
+        if not isinstance(path_item, dict):
+            continue
+
+        for method, operation in path_item.items():
+            if (
+                method.lower() in HTTP_METHODS
+                and isinstance(operation, dict)
+                and "security" in operation
+            ):
+                return True
+
+    return False
 
 
 def run_tests(args: argparse.Namespace) -> int:
@@ -298,11 +341,28 @@ def run_tests(args: argparse.Namespace) -> int:
         output_path = Path(args.output or f"testforge-report.{args.report}")
         validate_report_destination(output_path, args.report)
 
-        specification = OpenAPIParser(args.spec).parse()
+        parser = OpenAPIParser(args.spec)
+        document = parser.load()
+
+        security_analysis = analyze_security(document)
+
+        operation_auth = build_operation_auth(
+            security_analysis,
+            bearer_token=bearer_token,
+            basic_username=basic_username,
+            api_key=api_key,
+            api_key_name=api_key_name,
+            api_key_location=api_key_location,
+        )
+
+        specification = parser.parse()
         test_cases = ContractTestGenerator(specification).generate()
 
         if not test_cases:
-            print("Error: No contract tests were generated.", file=sys.stderr)
+            print(
+                "Error: No contract tests were generated.",
+                file=sys.stderr,
+            )
             return 2
 
         if args.max_response_time is not None:
@@ -317,6 +377,12 @@ def run_tests(args: argparse.Namespace) -> int:
             "approved_origins": {approved_origin},
             "allow_state_changes": args.allow_state_changes,
         }
+
+        # Preserve legacy authentication when no security requirements
+        # are explicitly declared. Defining securitySchemes alone
+        # does not change the existing credential behavior.
+        if has_explicit_security(document):
+            executor_options["operation_auth"] = operation_auth
 
         if bearer_token is not None:
             executor_options["bearer_token"] = bearer_token
@@ -405,10 +471,16 @@ def run_tests(args: argparse.Namespace) -> int:
 
         if gate_failures:
             print()
-            print("CI Quality Gates: FAILED", file=sys.stderr)
+            print(
+                "CI Quality Gates: FAILED",
+                file=sys.stderr,
+            )
 
             for failure in gate_failures:
-                print(f"  - {failure}", file=sys.stderr)
+                print(
+                    f"  - {failure}",
+                    file=sys.stderr,
+                )
 
         elif (
             args.min_generated_coverage is not None
@@ -421,7 +493,7 @@ def run_tests(args: argparse.Namespace) -> int:
 
         return 0
 
-    except (OSError, ValueError, KeyError) as error:
+    except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 2
 
