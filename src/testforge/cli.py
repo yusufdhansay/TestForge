@@ -10,6 +10,7 @@ from testforge.coverage import ContractCoverageAnalyzer
 from testforge.executor import (
     HTTPTestExecutor,
     validate_api_key_configuration,
+    validate_basic_auth,
     validate_bearer_token,
 )
 from testforge.generator import ContractTestGenerator
@@ -155,6 +156,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     run_parser.add_argument(
+        "--basic-username",
+        default=None,
+        metavar="USERNAME",
+        help=("HTTP Basic authentication username. Prefer TESTFORGE_BASIC_USERNAME."),
+    )
+
+    run_parser.add_argument(
+        "--basic-password",
+        default=None,
+        metavar="PASSWORD",
+        help=(
+            "HTTP Basic authentication password. "
+            "Prefer TESTFORGE_BASIC_PASSWORD to avoid shell history exposure."
+        ),
+    )
+
+    run_parser.add_argument(
         "--max-response-time",
         type=positive_milliseconds,
         default=None,
@@ -226,7 +244,6 @@ def run_tests(args: argparse.Namespace) -> int:
     approved_origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
 
     try:
-        # CLI credentials take precedence over environment variables.
         bearer_token = args.bearer_token
 
         if bearer_token is None:
@@ -240,6 +257,23 @@ def run_tests(args: argparse.Namespace) -> int:
         if api_key is None:
             api_key = os.environ.get("TESTFORGE_API_KEY")
 
+        basic_username = args.basic_username
+        basic_password = args.basic_password
+
+        if basic_username is None:
+            basic_username = os.environ.get("TESTFORGE_BASIC_USERNAME")
+
+        if basic_password is None:
+            basic_password = os.environ.get("TESTFORGE_BASIC_PASSWORD")
+
+        basic_username, basic_password = validate_basic_auth(
+            basic_username,
+            basic_password,
+        )
+
+        if bearer_token is not None and basic_username is not None:
+            raise ValueError("Basic and Bearer authentication cannot be used together")
+
         (
             api_key,
             api_key_name,
@@ -250,6 +284,16 @@ def run_tests(args: argparse.Namespace) -> int:
             api_key_location=args.api_key_in,
             bearer_token=bearer_token,
         )
+
+        if (
+            basic_username is not None
+            and api_key is not None
+            and api_key_location == "header"
+            and api_key_name.lower() == "authorization"
+        ):
+            raise ValueError(
+                "Basic authentication and an Authorization API key conflict"
+            )
 
         output_path = Path(args.output or f"testforge-report.{args.report}")
         validate_report_destination(output_path, args.report)
@@ -265,7 +309,8 @@ def run_tests(args: argparse.Namespace) -> int:
             for test_case in test_cases:
                 test_case.max_response_time_ms = args.max_response_time
 
-        # Preserve compatibility with older executor mocks.
+        # Only pass optional credentials when configured.
+        # Existing mocked constructors remain compatible.
         executor_options = {
             "base_url": args.base_url,
             "allow_network": True,
@@ -280,6 +325,10 @@ def run_tests(args: argparse.Namespace) -> int:
             executor_options["api_key"] = api_key
             executor_options["api_key_name"] = api_key_name
             executor_options["api_key_location"] = api_key_location
+
+        if basic_username is not None:
+            executor_options["basic_username"] = basic_username
+            executor_options["basic_password"] = basic_password
 
         with HTTPTestExecutor(**executor_options) as executor:
             results = [executor.execute(test_case) for test_case in test_cases]
@@ -338,7 +387,6 @@ def run_tests(args: argparse.Namespace) -> int:
                 f"{args.min_executed_coverage:.2f}%."
             )
 
-        # Always export the report before deciding the exit status.
         if args.report == "json":
             JSONReportExporter().export(
                 results,
