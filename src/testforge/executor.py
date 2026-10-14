@@ -10,6 +10,22 @@ from testforge.models import GeneratedTestCase
 from testforge.schema_normalizer import normalize_openapi_schema
 
 
+def validate_bearer_token(token: str) -> str:
+    """Validate a bearer token without exposing its value."""
+    if not isinstance(token, str) or not token:
+        raise ValueError("Bearer token must be a non-empty string")
+
+    if not token.isascii() or any(
+        character.isspace() or ord(character) < 33 or ord(character) == 127
+        for character in token
+    ):
+        raise ValueError(
+            "Bearer token must contain only non-whitespace ASCII characters"
+        )
+
+    return token
+
+
 class HTTPTestExecutor:
     def __init__(
         self,
@@ -20,6 +36,7 @@ class HTTPTestExecutor:
         allow_network: bool = False,
         approved_origins: set[str] | None = None,
         allow_state_changes: bool = False,
+        bearer_token: str | None = None,
     ):
         if timeout <= 0:
             raise ValueError("Timeout must be positive")
@@ -51,6 +68,10 @@ class HTTPTestExecutor:
         self.base_url = base_url.rstrip("/")
         self.allow_state_changes = allow_state_changes
 
+        self.bearer_token = (
+            validate_bearer_token(bearer_token) if bearer_token is not None else None
+        )
+
         self.client = httpx.Client(
             base_url=self.base_url,
             transport=transport,
@@ -59,9 +80,20 @@ class HTTPTestExecutor:
             trust_env=False,
         )
 
+    def _redact_error(self, message: str) -> str:
+        """Prevent configured credentials from appearing in error reports."""
+        token = getattr(self, "bearer_token", None)
+
+        if token:
+            return message.replace(token, "[REDACTED]")
+
+        return message
+
     def execute(self, test_case: GeneratedTestCase) -> ExecutionResult:
+        """Execute one generated API contract test."""
         started = perf_counter()
 
+        # Block state-changing requests unless explicitly approved.
         if (
             test_case.method.upper() not in {"GET", "HEAD", "OPTIONS"}
             and not self.allow_state_changes
@@ -70,12 +102,13 @@ class HTTPTestExecutor:
                 test_id=test_case.test_id,
                 status=ExecutionStatus.ERROR,
                 expected_status_codes=test_case.expected_status_codes,
-                error_message=("State-changing HTTP methods require explicit approval"),
+                error_message="State-changing HTTP methods require explicit approval",
             )
 
         try:
             path = test_case.path
 
+            # Resolve path parameters.
             for name, value in test_case.path_parameters.items():
                 path = path.replace(
                     "{" + name + "}",
@@ -87,6 +120,7 @@ class HTTPTestExecutor:
 
             parsed_path = urlsplit(path)
 
+            # Prevent requests to unexpected hosts or unsafe paths.
             if (
                 not path.startswith("/")
                 or path.startswith("//")
@@ -98,27 +132,47 @@ class HTTPTestExecutor:
             ):
                 raise ValueError(f"Unsafe API path: {path}")
 
+            # Build request headers without modifying the generated test.
+            headers = dict(test_case.headers)
+
+            # Older test doubles may replace __init__ and therefore
+            # may not initialize the bearer_token attribute.
+            bearer_token = getattr(self, "bearer_token", None)
+
+            if bearer_token is not None:
+                # Remove any generated Authorization header regardless
+                # of capitalization before applying the configured token.
+                headers = {
+                    key: value
+                    for key, value in headers.items()
+                    if key.lower() != "authorization"
+                }
+
+                headers["Authorization"] = f"Bearer {bearer_token}"
+
             response = self.client.request(
                 method=test_case.method,
                 url=path,
                 params=test_case.query_parameters,
-                headers=test_case.headers,
+                headers=headers,
                 json=test_case.request_body,
             )
 
             elapsed_ms = (perf_counter() - started) * 1000
 
-            # 1. HTTP status-code assertion
+            # 1. HTTP status-code assertion.
             if not test_case.expected_status_codes:
                 status = ExecutionStatus.UNASSERTED
+
             elif response.status_code in test_case.expected_status_codes:
                 status = ExecutionStatus.PASSED
+
             else:
                 status = ExecutionStatus.FAILED
 
             error_message = None
 
-            # 2. Response schema and Content-Type validation
+            # 2. Response schema and Content-Type validation.
             if status == ExecutionStatus.PASSED:
                 schema = test_case.response_schemas.get(response.status_code)
 
@@ -129,11 +183,13 @@ class HTTPTestExecutor:
 
                         if media_type != "application/json":
                             status = ExecutionStatus.FAILED
+
                             error_message = (
                                 "Response Content-Type mismatch: "
                                 "expected application/json, "
                                 f"received {content_type or 'missing'}"
                             )
+
                         else:
                             schema = normalize_openapi_schema(schema)
 
@@ -153,19 +209,22 @@ class HTTPTestExecutor:
 
                     except ValidationError as error:
                         status = ExecutionStatus.FAILED
+
                         error_message = (
                             f"Response schema validation failed: {error.message}"
                         )
 
                     except (ValueError, httpx.DecodingError) as error:
                         status = ExecutionStatus.FAILED
+
                         error_message = f"Invalid JSON response: {error}"
 
                     except SchemaError as error:
                         status = ExecutionStatus.ERROR
+
                         error_message = f"Invalid response schema: {error.message}"
 
-            # 3. Response-time assertion
+            # 3. Response-time assertion.
             # Preserve any existing status or schema failure.
             if (
                 status == ExecutionStatus.PASSED
@@ -173,20 +232,25 @@ class HTTPTestExecutor:
                 and elapsed_ms > test_case.max_response_time_ms
             ):
                 status = ExecutionStatus.FAILED
+
                 error_message = (
                     "Response time exceeded threshold: "
                     f"{elapsed_ms:.2f} ms > "
                     f"{test_case.max_response_time_ms:.2f} ms"
                 )
 
-            # 4. Return the final execution result
+            # 4. Return the final execution result.
             return ExecutionResult(
                 test_id=test_case.test_id,
                 status=status,
                 actual_status_code=response.status_code,
                 expected_status_codes=test_case.expected_status_codes,
                 response_time_ms=round(elapsed_ms, 2),
-                error_message=error_message,
+                error_message=(
+                    self._redact_error(error_message)
+                    if error_message is not None
+                    else None
+                ),
             )
 
         except (httpx.HTTPError, ValueError) as error:
@@ -197,10 +261,11 @@ class HTTPTestExecutor:
                 status=ExecutionStatus.ERROR,
                 expected_status_codes=test_case.expected_status_codes,
                 response_time_ms=round(elapsed_ms, 2),
-                error_message=str(error),
+                error_message=self._redact_error(str(error)),
             )
 
     def close(self) -> None:
+        """Close the underlying HTTP client."""
         self.client.close()
 
     def __enter__(self):

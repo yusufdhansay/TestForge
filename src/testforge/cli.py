@@ -1,12 +1,13 @@
 import argparse
 import math
+import os
 import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from testforge.coverage import ContractCoverageAnalyzer
-from testforge.executor import HTTPTestExecutor
+from testforge.executor import HTTPTestExecutor, validate_bearer_token
 from testforge.generator import ContractTestGenerator
 from testforge.html_reporter import HTMLReportExporter
 from testforge.json_reporter import JSONReportExporter
@@ -116,6 +117,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     run_parser.add_argument(
+        "--bearer-token",
+        default=None,
+        metavar="TOKEN",
+        help=(
+            "Bearer token for API authentication. "
+            "Prefer the TESTFORGE_BEARER_TOKEN environment variable "
+            "to avoid exposing secrets in shell history."
+        ),
+    )
+
+    run_parser.add_argument(
         "--max-response-time",
         type=positive_milliseconds,
         default=None,
@@ -187,6 +199,16 @@ def run_tests(args: argparse.Namespace) -> int:
     approved_origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
 
     try:
+        # Resolve authentication credentials.
+        # An explicit CLI token takes precedence over the environment variable.
+        bearer_token = args.bearer_token
+
+        if bearer_token is None:
+            bearer_token = os.environ.get("TESTFORGE_BEARER_TOKEN")
+
+        if bearer_token is not None:
+            bearer_token = validate_bearer_token(bearer_token)
+
         output_path = Path(args.output or f"testforge-report.{args.report}")
         validate_report_destination(output_path, args.report)
 
@@ -201,15 +223,25 @@ def run_tests(args: argparse.Namespace) -> int:
             for test_case in test_cases:
                 test_case.max_response_time_ms = args.max_response_time
 
-        with HTTPTestExecutor(
-            base_url=args.base_url,
-            allow_network=True,
-            approved_origins={approved_origin},
-            allow_state_changes=args.allow_state_changes,
-        ) as executor:
+        # Build executor configuration.
+        # Only pass bearer_token when authentication is configured.
+        # This preserves compatibility with existing executor integrations
+        # and test doubles that use the previous constructor signature.
+        executor_options = {
+            "base_url": args.base_url,
+            "allow_network": True,
+            "approved_origins": {approved_origin},
+            "allow_state_changes": args.allow_state_changes,
+        }
+
+        if bearer_token is not None:
+            executor_options["bearer_token"] = bearer_token
+
+        with HTTPTestExecutor(**executor_options) as executor:
             results = [executor.execute(test_case) for test_case in test_cases]
 
         summary = ExecutionReporter().summarize(results)
+
         coverage = ContractCoverageAnalyzer().analyze(
             specification,
             test_cases,
@@ -234,9 +266,11 @@ def run_tests(args: argparse.Namespace) -> int:
         if coverage.untested_operations:
             print()
             print("Untested API operations:")
+
             for operation in coverage.untested_operations:
                 print(f"  - {operation}")
 
+        # Evaluate CI quality gates.
         gate_failures = []
 
         if (
@@ -261,6 +295,7 @@ def run_tests(args: argparse.Namespace) -> int:
                 f"{args.min_executed_coverage:.2f}%."
             )
 
+        # Export the report before evaluating the final exit status.
         if args.report == "json":
             JSONReportExporter().export(
                 results,
@@ -280,8 +315,10 @@ def run_tests(args: argparse.Namespace) -> int:
         if gate_failures:
             print()
             print("CI Quality Gates: FAILED", file=sys.stderr)
+
             for failure in gate_failures:
                 print(f"  - {failure}", file=sys.stderr)
+
         elif (
             args.min_generated_coverage is not None
             or args.min_executed_coverage is not None
