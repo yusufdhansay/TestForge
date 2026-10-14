@@ -1,3 +1,4 @@
+import re
 from time import perf_counter
 from urllib.parse import quote, urlsplit
 
@@ -8,6 +9,9 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from testforge.execution_models import ExecutionResult, ExecutionStatus
 from testforge.models import GeneratedTestCase
 from testforge.schema_normalizer import normalize_openapi_schema
+
+HTTP_TOKEN_PATTERN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+QUERY_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 
 
 def validate_bearer_token(token: str) -> str:
@@ -26,6 +30,55 @@ def validate_bearer_token(token: str) -> str:
     return token
 
 
+def validate_api_key(key: str) -> str:
+    """Validate an API key without including its value in errors."""
+    if not isinstance(key, str) or not key:
+        raise ValueError("API key must be a non-empty string")
+
+    if not key.isascii() or any(
+        ord(character) < 33 or ord(character) > 126 for character in key
+    ):
+        raise ValueError(
+            "API key must contain only printable, non-whitespace ASCII characters"
+        )
+
+    return key
+
+
+def validate_api_key_configuration(
+    api_key: str | None,
+    api_key_name: str | None,
+    api_key_location: str,
+    bearer_token: str | None = None,
+) -> tuple[str | None, str | None, str]:
+    """Validate API key settings before constructing HTTP requests."""
+    if api_key_location not in {"header", "query"}:
+        raise ValueError("API key location must be 'header' or 'query'")
+
+    if api_key is None:
+        if api_key_name is not None:
+            raise ValueError("API key name requires an API key")
+        return None, None, api_key_location
+
+    validated_key = validate_api_key(api_key)
+
+    if api_key_name is None:
+        api_key_name = "X-API-Key" if api_key_location == "header" else "api_key"
+
+    if api_key_location == "header":
+        if not HTTP_TOKEN_PATTERN.fullmatch(api_key_name):
+            raise ValueError("Invalid API key header name")
+
+        if api_key_name.lower() == "authorization" and bearer_token is not None:
+            raise ValueError(
+                "Bearer authentication and an Authorization API key conflict"
+            )
+    elif not QUERY_NAME_PATTERN.fullmatch(api_key_name):
+        raise ValueError("Invalid API key query parameter name")
+
+    return validated_key, api_key_name, api_key_location
+
+
 class HTTPTestExecutor:
     def __init__(
         self,
@@ -37,6 +90,9 @@ class HTTPTestExecutor:
         approved_origins: set[str] | None = None,
         allow_state_changes: bool = False,
         bearer_token: str | None = None,
+        api_key: str | None = None,
+        api_key_name: str | None = None,
+        api_key_location: str = "header",
     ):
         if timeout <= 0:
             raise ValueError("Timeout must be positive")
@@ -67,9 +123,19 @@ class HTTPTestExecutor:
 
         self.base_url = base_url.rstrip("/")
         self.allow_state_changes = allow_state_changes
-
         self.bearer_token = (
             validate_bearer_token(bearer_token) if bearer_token is not None else None
+        )
+
+        (
+            self.api_key,
+            self.api_key_name,
+            self.api_key_location,
+        ) = validate_api_key_configuration(
+            api_key,
+            api_key_name,
+            api_key_location,
+            self.bearer_token,
         )
 
         self.client = httpx.Client(
@@ -81,11 +147,15 @@ class HTTPTestExecutor:
         )
 
     def _redact_error(self, message: str) -> str:
-        """Prevent configured credentials from appearing in error reports."""
-        token = getattr(self, "bearer_token", None)
+        """Remove configured credentials from execution error messages."""
+        credentials = (
+            getattr(self, "bearer_token", None),
+            getattr(self, "api_key", None),
+        )
 
-        if token:
-            return message.replace(token, "[REDACTED]")
+        for credential in credentials:
+            if credential:
+                message = message.replace(credential, "[REDACTED]")
 
         return message
 
@@ -93,7 +163,6 @@ class HTTPTestExecutor:
         """Execute one generated API contract test."""
         started = perf_counter()
 
-        # Block state-changing requests unless explicitly approved.
         if (
             test_case.method.upper() not in {"GET", "HEAD", "OPTIONS"}
             and not self.allow_state_changes
@@ -108,7 +177,6 @@ class HTTPTestExecutor:
         try:
             path = test_case.path
 
-            # Resolve path parameters.
             for name, value in test_case.path_parameters.items():
                 path = path.replace(
                     "{" + name + "}",
@@ -120,7 +188,6 @@ class HTTPTestExecutor:
 
             parsed_path = urlsplit(path)
 
-            # Prevent requests to unexpected hosts or unsafe paths.
             if (
                 not path.startswith("/")
                 or path.startswith("//")
@@ -132,28 +199,40 @@ class HTTPTestExecutor:
             ):
                 raise ValueError(f"Unsafe API path: {path}")
 
-            # Build request headers without modifying the generated test.
+            # Copy generated values so authentication cannot mutate tests.
             headers = dict(test_case.headers)
+            query_parameters = dict(test_case.query_parameters)
 
-            # Older test doubles may replace __init__ and therefore
-            # may not initialize the bearer_token attribute.
+            # getattr preserves compatibility with older mocked constructors.
             bearer_token = getattr(self, "bearer_token", None)
+            api_key = getattr(self, "api_key", None)
+            api_key_name = getattr(self, "api_key_name", None)
+            api_key_location = getattr(self, "api_key_location", "header")
 
             if bearer_token is not None:
-                # Remove any generated Authorization header regardless
-                # of capitalization before applying the configured token.
                 headers = {
                     key: value
                     for key, value in headers.items()
                     if key.lower() != "authorization"
                 }
-
                 headers["Authorization"] = f"Bearer {bearer_token}"
+
+            if api_key is not None:
+                if api_key_location == "header":
+                    headers = {
+                        key: value
+                        for key, value in headers.items()
+                        if key.lower() != api_key_name.lower()
+                    }
+                    headers[api_key_name] = api_key
+                else:
+                    # The configured credential overrides generated values.
+                    query_parameters[api_key_name] = api_key
 
             response = self.client.request(
                 method=test_case.method,
                 url=path,
-                params=test_case.query_parameters,
+                params=query_parameters,
                 headers=headers,
                 json=test_case.request_body,
             )
@@ -163,10 +242,8 @@ class HTTPTestExecutor:
             # 1. HTTP status-code assertion.
             if not test_case.expected_status_codes:
                 status = ExecutionStatus.UNASSERTED
-
             elif response.status_code in test_case.expected_status_codes:
                 status = ExecutionStatus.PASSED
-
             else:
                 status = ExecutionStatus.FAILED
 
@@ -183,16 +260,13 @@ class HTTPTestExecutor:
 
                         if media_type != "application/json":
                             status = ExecutionStatus.FAILED
-
                             error_message = (
                                 "Response Content-Type mismatch: "
                                 "expected application/json, "
                                 f"received {content_type or 'missing'}"
                             )
-
                         else:
                             schema = normalize_openapi_schema(schema)
-
                             Draft202012Validator.check_schema(schema)
 
                             if (
@@ -204,42 +278,35 @@ class HTTPTestExecutor:
                                 )
 
                             response_data = response.json()
-
                             Draft202012Validator(schema).validate(response_data)
 
                     except ValidationError as error:
                         status = ExecutionStatus.FAILED
-
                         error_message = (
                             f"Response schema validation failed: {error.message}"
                         )
 
                     except (ValueError, httpx.DecodingError) as error:
                         status = ExecutionStatus.FAILED
-
                         error_message = f"Invalid JSON response: {error}"
 
                     except SchemaError as error:
                         status = ExecutionStatus.ERROR
-
                         error_message = f"Invalid response schema: {error.message}"
 
             # 3. Response-time assertion.
-            # Preserve any existing status or schema failure.
             if (
                 status == ExecutionStatus.PASSED
                 and test_case.max_response_time_ms is not None
                 and elapsed_ms > test_case.max_response_time_ms
             ):
                 status = ExecutionStatus.FAILED
-
                 error_message = (
                     "Response time exceeded threshold: "
                     f"{elapsed_ms:.2f} ms > "
                     f"{test_case.max_response_time_ms:.2f} ms"
                 )
 
-            # 4. Return the final execution result.
             return ExecutionResult(
                 test_id=test_case.test_id,
                 status=status,

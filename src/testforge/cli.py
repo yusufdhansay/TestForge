@@ -7,7 +7,11 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from testforge.coverage import ContractCoverageAnalyzer
-from testforge.executor import HTTPTestExecutor, validate_bearer_token
+from testforge.executor import (
+    HTTPTestExecutor,
+    validate_api_key_configuration,
+    validate_bearer_token,
+)
 from testforge.generator import ContractTestGenerator
 from testforge.html_reporter import HTMLReportExporter
 from testforge.json_reporter import JSONReportExporter
@@ -122,9 +126,32 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TOKEN",
         help=(
             "Bearer token for API authentication. "
-            "Prefer the TESTFORGE_BEARER_TOKEN environment variable "
-            "to avoid exposing secrets in shell history."
+            "Prefer TESTFORGE_BEARER_TOKEN to avoid shell history exposure."
         ),
+    )
+
+    run_parser.add_argument(
+        "--api-key",
+        default=None,
+        metavar="KEY",
+        help=("API key credential. Prefer the TESTFORGE_API_KEY environment variable."),
+    )
+
+    run_parser.add_argument(
+        "--api-key-name",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Header or query parameter name for the API key. "
+            "Defaults to X-API-Key for headers or api_key for queries."
+        ),
+    )
+
+    run_parser.add_argument(
+        "--api-key-in",
+        choices=["header", "query"],
+        default="header",
+        help="Send the API key in a header or query parameter (default: header).",
     )
 
     run_parser.add_argument(
@@ -199,8 +226,7 @@ def run_tests(args: argparse.Namespace) -> int:
     approved_origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
 
     try:
-        # Resolve authentication credentials.
-        # An explicit CLI token takes precedence over the environment variable.
+        # CLI credentials take precedence over environment variables.
         bearer_token = args.bearer_token
 
         if bearer_token is None:
@@ -208,6 +234,22 @@ def run_tests(args: argparse.Namespace) -> int:
 
         if bearer_token is not None:
             bearer_token = validate_bearer_token(bearer_token)
+
+        api_key = args.api_key
+
+        if api_key is None:
+            api_key = os.environ.get("TESTFORGE_API_KEY")
+
+        (
+            api_key,
+            api_key_name,
+            api_key_location,
+        ) = validate_api_key_configuration(
+            api_key=api_key,
+            api_key_name=args.api_key_name,
+            api_key_location=args.api_key_in,
+            bearer_token=bearer_token,
+        )
 
         output_path = Path(args.output or f"testforge-report.{args.report}")
         validate_report_destination(output_path, args.report)
@@ -223,10 +265,7 @@ def run_tests(args: argparse.Namespace) -> int:
             for test_case in test_cases:
                 test_case.max_response_time_ms = args.max_response_time
 
-        # Build executor configuration.
-        # Only pass bearer_token when authentication is configured.
-        # This preserves compatibility with existing executor integrations
-        # and test doubles that use the previous constructor signature.
+        # Preserve compatibility with older executor mocks.
         executor_options = {
             "base_url": args.base_url,
             "allow_network": True,
@@ -236,6 +275,11 @@ def run_tests(args: argparse.Namespace) -> int:
 
         if bearer_token is not None:
             executor_options["bearer_token"] = bearer_token
+
+        if api_key is not None:
+            executor_options["api_key"] = api_key
+            executor_options["api_key_name"] = api_key_name
+            executor_options["api_key_location"] = api_key_location
 
         with HTTPTestExecutor(**executor_options) as executor:
             results = [executor.execute(test_case) for test_case in test_cases]
@@ -270,7 +314,6 @@ def run_tests(args: argparse.Namespace) -> int:
             for operation in coverage.untested_operations:
                 print(f"  - {operation}")
 
-        # Evaluate CI quality gates.
         gate_failures = []
 
         if (
@@ -295,7 +338,7 @@ def run_tests(args: argparse.Namespace) -> int:
                 f"{args.min_executed_coverage:.2f}%."
             )
 
-        # Export the report before evaluating the final exit status.
+        # Always export the report before deciding the exit status.
         if args.report == "json":
             JSONReportExporter().export(
                 results,
