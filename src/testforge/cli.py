@@ -1,4 +1,5 @@
 import argparse
+import math
 import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -18,6 +19,22 @@ def get_version() -> str:
         return version("testforge")
     except PackageNotFoundError:
         return "unknown"
+
+
+def positive_milliseconds(value: str) -> float:
+    """Parse a finite, strictly positive response-time threshold."""
+    try:
+        threshold = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "Response-time threshold must be a positive number of milliseconds."
+        ) from error
+
+    if not math.isfinite(threshold) or threshold <= 0:
+        raise argparse.ArgumentTypeError(
+            "Response-time threshold must be a finite positive number of milliseconds."
+        )
+    return threshold
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -79,6 +96,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow POST, PUT, PATCH, and DELETE requests.",
     )
 
+    run_parser.add_argument(
+        "--max-response-time",
+        type=positive_milliseconds,
+        default=None,
+        metavar="MS",
+        help="Maximum allowed response time in milliseconds (positive number).",
+    )
+
     return parser
 
 
@@ -87,7 +112,6 @@ def validate_report_destination(
     report_format: str,
 ) -> None:
     """Validate report destination before executing API requests."""
-
     expected_suffix = f".{report_format}"
 
     if output_path.suffix.lower() != expected_suffix:
@@ -104,7 +128,6 @@ def validate_report_destination(
 
 def run_tests(args: argparse.Namespace) -> int:
     """Generate, execute, and report API contract tests."""
-
     if not args.allow_network:
         print(
             "Error: Network access is disabled. "
@@ -130,16 +153,18 @@ def run_tests(args: argparse.Namespace) -> int:
 
     try:
         output_path = Path(args.output or f"testforge-report.{args.report}")
-
         validate_report_destination(output_path, args.report)
 
         specification = OpenAPIParser(args.spec).parse()
-
         test_cases = ContractTestGenerator(specification).generate()
 
         if not test_cases:
             print("Error: No contract tests were generated.", file=sys.stderr)
             return 2
+
+        if args.max_response_time is not None:
+            for test_case in test_cases:
+                test_case.max_response_time_ms = args.max_response_time
 
         with HTTPTestExecutor(
             base_url=args.base_url,
@@ -167,7 +192,6 @@ def run_tests(args: argparse.Namespace) -> int:
 
         if summary.failed > 0 or summary.errors > 0:
             return 1
-
         return 0
 
     except (OSError, ValueError, KeyError) as error:

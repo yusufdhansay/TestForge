@@ -62,3 +62,8 @@ class GeneratedTestCase(BaseModel):
     response_schemas: dict[int, dict[str, Any]] = Field(default_factory=dict)
 
     response_expectation: ResponseExpectation | None = None
+
+    max_response_time_ms: float | None = Field(
+        default=None,
+        gt=0,
+    )
