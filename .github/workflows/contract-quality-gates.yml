@@ -1,0 +1,86 @@
+
+name: Contract Quality Gates
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract-quality-gates:
+    name: API Contract Quality Gates
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install TestForge
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Start local mock API
+        run: |
+          python scripts/ci_mock_server.py \
+            > /tmp/testforge-mock-api.log 2>&1 &
+
+          echo $! > /tmp/testforge-mock-api.pid
+
+          python - <<'PY'
+          import time
+          import urllib.error
+          import urllib.request
+
+          url = "http://127.0.0.1:8765/health"
+
+          for attempt in range(30):
+              try:
+                  with urllib.request.urlopen(url, timeout=1) as response:
+                      if response.status == 200:
+                          print("Mock API is ready.")
+                          break
+              except (OSError, urllib.error.URLError):
+                  time.sleep(0.2)
+          else:
+              raise SystemExit("Mock API failed to start.")
+          PY
+
+      - name: Run contract quality gates
+        run: |
+          testforge run examples/ci_mock_api.json \
+            --base-url http://127.0.0.1:8765 \
+            --allow-network \
+            --min-generated-coverage 100 \
+            --min-executed-coverage 100 \
+            --report json \
+            --output testforge-ci-report.json
+
+      - name: Upload contract report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testforge-contract-report
+          path: testforge-ci-report.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Show mock API logs on failure
+        if: failure()
+        run: |
+          if [ -f /tmp/testforge-mock-api.log ]; then
+            cat /tmp/testforge-mock-api.log
+          fi

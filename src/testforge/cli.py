@@ -39,6 +39,23 @@ def positive_milliseconds(value: str) -> float:
     return threshold
 
 
+def coverage_percentage(value: str) -> float:
+    """Parse a finite coverage percentage between 0 and 100."""
+    try:
+        percentage = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "Coverage threshold must be a number between 0 and 100."
+        ) from error
+
+    if not math.isfinite(percentage) or not 0 <= percentage <= 100:
+        raise argparse.ArgumentTypeError(
+            "Coverage threshold must be a finite number between 0 and 100."
+        )
+
+    return percentage
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the TestForge command-line argument parser."""
     parser = argparse.ArgumentParser(
@@ -104,6 +121,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="MS",
         help="Maximum allowed response time in milliseconds (positive number).",
+    )
+
+    run_parser.add_argument(
+        "--min-generated-coverage",
+        type=coverage_percentage,
+        default=None,
+        metavar="PERCENT",
+        help="Minimum required generated operation coverage (0-100).",
+    )
+
+    run_parser.add_argument(
+        "--min-executed-coverage",
+        type=coverage_percentage,
+        default=None,
+        metavar="PERCENT",
+        help="Minimum required executed operation coverage (0-100).",
     )
 
     return parser
@@ -204,6 +237,30 @@ def run_tests(args: argparse.Namespace) -> int:
             for operation in coverage.untested_operations:
                 print(f"  - {operation}")
 
+        gate_failures = []
+
+        if (
+            args.min_generated_coverage is not None
+            and coverage.generated_coverage_percent < args.min_generated_coverage
+        ):
+            gate_failures.append(
+                "Generated coverage "
+                f"{coverage.generated_coverage_percent:.2f}% "
+                "is below the required "
+                f"{args.min_generated_coverage:.2f}%."
+            )
+
+        if (
+            args.min_executed_coverage is not None
+            and coverage.executed_coverage_percent < args.min_executed_coverage
+        ):
+            gate_failures.append(
+                "Executed coverage "
+                f"{coverage.executed_coverage_percent:.2f}% "
+                "is below the required "
+                f"{args.min_executed_coverage:.2f}%."
+            )
+
         if args.report == "json":
             JSONReportExporter().export(
                 results,
@@ -220,7 +277,18 @@ def run_tests(args: argparse.Namespace) -> int:
         print()
         print(f"Report:     {output_path}")
 
-        if summary.failed > 0 or summary.errors > 0:
+        if gate_failures:
+            print()
+            print("CI Quality Gates: FAILED", file=sys.stderr)
+            for failure in gate_failures:
+                print(f"  - {failure}", file=sys.stderr)
+        elif (
+            args.min_generated_coverage is not None
+            or args.min_executed_coverage is not None
+        ):
+            print("CI Quality Gates: PASSED")
+
+        if summary.failed > 0 or summary.errors > 0 or gate_failures:
             return 1
 
         return 0
