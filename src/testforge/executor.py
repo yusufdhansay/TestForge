@@ -2,9 +2,12 @@ from time import perf_counter
 from urllib.parse import quote, urlsplit
 
 import httpx
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError, ValidationError
 
 from testforge.execution_models import ExecutionResult, ExecutionStatus
 from testforge.models import GeneratedTestCase
+from testforge.schema_normalizer import normalize_openapi_schema
 
 
 class HTTPTestExecutor:
@@ -111,12 +114,60 @@ class HTTPTestExecutor:
             else:
                 status = ExecutionStatus.FAILED
 
+            error_message = None
+
+            if status == ExecutionStatus.PASSED:
+                schema = test_case.response_schemas.get(response.status_code)
+
+                if schema is not None:
+                    try:
+                        content_type = response.headers.get("Content-Type", "")
+                        media_type = content_type.split(";", 1)[0].strip().lower()
+
+                        if media_type != "application/json":
+                            status = ExecutionStatus.FAILED
+                            error_message = (
+                                "Response Content-Type mismatch: "
+                                f"expected application/json, received {content_type or 'missing'}"
+                            )
+                        else:
+                            schema = normalize_openapi_schema(schema)
+                            Draft202012Validator.check_schema(schema)
+
+                            response_data = response.json()
+                            Draft202012Validator(schema).validate(response_data)
+                            Draft202012Validator.check_schema(schema)
+
+                        if response.status_code in {204, 205} and not response.content:
+                            # Empty responses are valid only when no body is expected.
+                            raise ValueError(
+                                "Response body missing for declared JSON schema"
+                            )
+
+                        response_data = response.json()
+                        Draft202012Validator(schema).validate(response_data)
+
+                    except ValidationError as error:
+                        status = ExecutionStatus.FAILED
+                        error_message = (
+                            f"Response schema validation failed: {error.message}"
+                        )
+
+                    except (ValueError, httpx.DecodingError) as error:
+                        status = ExecutionStatus.FAILED
+                        error_message = f"Invalid JSON response: {error}"
+
+                    except SchemaError as error:
+                        status = ExecutionStatus.ERROR
+                        error_message = f"Invalid response schema: {error.message}"
+
             return ExecutionResult(
                 test_id=test_case.test_id,
                 status=status,
                 actual_status_code=response.status_code,
                 expected_status_codes=test_case.expected_status_codes,
                 response_time_ms=round(elapsed_ms, 2),
+                error_message=error_message,
             )
 
         except (httpx.HTTPError, ValueError) as error:

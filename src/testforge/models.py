@@ -59,4 +59,6 @@ class GeneratedTestCase(BaseModel):
 
     expected_status_codes: list[int] = Field(default_factory=list)
 
+    response_schemas: dict[int, dict[str, Any]] = Field(default_factory=dict)
+
     response_expectation: ResponseExpectation | None = None
