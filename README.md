@@ -1,4 +1,5 @@
 # TestForge
+[![TestForge CI](https://github.com/yusufdhansay/TestForge/actions/workflows/ci.yml/badge.svg)](https://github.com/yusufdhansay/TestForge/actions/workflows/ci.yml)
 
 An automated API testing and reliability engineering platform.
 
