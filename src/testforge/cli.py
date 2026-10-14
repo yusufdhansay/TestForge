@@ -5,6 +5,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from testforge.coverage import ContractCoverageAnalyzer
 from testforge.executor import HTTPTestExecutor
 from testforge.generator import ContractTestGenerator
 from testforge.html_reporter import HTMLReportExporter
@@ -34,6 +35,7 @@ def positive_milliseconds(value: str) -> float:
         raise argparse.ArgumentTypeError(
             "Response-time threshold must be a finite positive number of milliseconds."
         )
+
     return threshold
 
 
@@ -175,6 +177,11 @@ def run_tests(args: argparse.Namespace) -> int:
             results = [executor.execute(test_case) for test_case in test_cases]
 
         summary = ExecutionReporter().summarize(results)
+        coverage = ContractCoverageAnalyzer().analyze(
+            specification,
+            test_cases,
+            results,
+        )
 
         print(f"Total:      {summary.total}")
         print(f"Passed:     {summary.passed}")
@@ -183,15 +190,39 @@ def run_tests(args: argparse.Namespace) -> int:
         print(f"Errors:     {summary.errors}")
         print(f"Pass rate:  {summary.pass_rate:.2f}%")
 
-        if args.report == "json":
-            JSONReportExporter().export(results, output_path)
-        else:
-            HTMLReportExporter().export(results, output_path)
+        print()
+        print("Contract Coverage")
+        print("-----------------------------")
+        print(f"Total operations:       {coverage.total_operations}")
+        print(f"Generated coverage:     {coverage.generated_coverage_percent:.2f}%")
+        print(f"Executed coverage:      {coverage.executed_coverage_percent:.2f}%")
+        print(f"Untested operations:    {len(coverage.untested_operations)}")
 
+        if coverage.untested_operations:
+            print()
+            print("Untested API operations:")
+            for operation in coverage.untested_operations:
+                print(f"  - {operation}")
+
+        if args.report == "json":
+            JSONReportExporter().export(
+                results,
+                output_path,
+                coverage=coverage,
+            )
+        else:
+            HTMLReportExporter().export(
+                results,
+                output_path,
+                coverage=coverage,
+            )
+
+        print()
         print(f"Report:     {output_path}")
 
         if summary.failed > 0 or summary.errors > 0:
             return 1
+
         return 0
 
     except (OSError, ValueError, KeyError) as error:
